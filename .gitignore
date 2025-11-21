@@ -1,0 +1,7 @@
+libri/
+venv/
+app/__pycache__/
+tools/__pycache__/
+logic/__pycache__/
+agents/__pycache__/
+documenti_medici/

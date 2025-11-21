@@ -1,0 +1,20 @@
+{
+  "raccomandazioni": {
+    "cura_personale": {
+      "livello": "Cura Personale (Basso Rischio)",
+      "messaggio": "Sulla base delle informazioni fornite, i sintomi sembrano essere di lieve entità. Si consiglia riposo, idratazione e monitoraggio. Se i sintomi dovessero peggiorare, contatta il tuo medico."
+    },
+    "contatta_medico": {
+      "livello": "Contatta il Medico (Medio Rischio)",
+      "messaggio": "I sintomi descritti, analizzati alla luce delle nostre fonti, suggeriscono che sarebbe saggio consultare il tuo medico di base per una valutazione approfondita."
+    },
+    "cura_urgente": {
+      "livello": "Cura Urgente (Alto Rischio)",
+      "messaggio": "L'analisi dei sintomi indica un potenziale rischio che richiede attenzione medica tempestiva. Ti raccomandiamo di contattare la guardia medica o di recarti al pronto soccorso."
+    }
+  },
+  "risposta_default": {
+    "livello": "Informazioni Insufficienti",
+    "messaggio": "Non sono riuscito a formulare una raccomandazione chiara sulla base dei dati forniti. Per favore, descrivi i sintomi in modo più dettagliato o contatta direttamente un medico per qualsiasi dubbio."
+  }
+}

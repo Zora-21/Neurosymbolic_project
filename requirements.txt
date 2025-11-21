@@ -1,0 +1,10 @@
+fastapi[all]
+ollama
+streamlit
+requests
+langchain
+langchain-community
+chromadb
+sentence-transformers
+pypdf
+langchain-chroma
