@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="it">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Clinica Virtuale AI</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+</head>
+
+<body>
+    <div class="container">
+        <!-- Colonna Sinistra: Chat -->
+        <div class="chat-column">
+            <header class="chat-header">
+                <h1>🏥 Clinica Virtuale AI</h1>
+                <button id="reset-btn" class="icon-btn" title="Nuova Sessione">🗑️</button>
+            </header>
+
+            <div id="chat-container" class="chat-messages">
+                <!-- Messaggi verranno inseriti qui -->
+                <div class="message system">
+                    <div class="message-content">
+                        <strong>System:</strong> Benvenuto. Descrivi i tuoi sintomi per iniziare.
+                    </div>
+                </div>
+            </div>
+
+            <div class="chat-input-area">
+                <div id="image-preview-container" class="hidden">
+                    <img id="image-preview" src="" alt="Anteprima">
+                    <button id="remove-image-btn" title="Rimuovi">×</button>
+                </div>
+                <input type="file" id="image-input" accept="image/*" style="display: none;">
+                <button id="upload-btn" class="icon-btn" title="Invia Foto">📷</button>
+                <input type="text" id="user-input" placeholder="Descrivi qui i tuoi sintomi..." autocomplete="off">
+                <button id="send-btn">Invia</button>
+            </div>
+        </div>
+
+        <!-- Colonna Destra: Info -->
+        <div class="info-column">
+            <div class="info-card agent-card">
+                <h2>👨‍⚕️ Specialista Attivo</h2>
+                <div id="current-agent" class="agent-badge">Router</div>
+            </div>
+
+            <div class="info-card patient-card">
+                <h2>📋 Dati Paziente (Live)</h2>
+                <div id="patient-data-content">
+                    <p><em>In attesa di dati...</em></p>
+                </div>
+            </div>
+
+            <div class="info-card report-card">
+                <h2>📊 Report & Diagnosi</h2>
+                <div id="report-content">
+                    <p><em>Nessun report disponibile.</em></p>
+                </div>
+            </div>
+        </div>
+    </div>
+    <script src="/static/script.js"></script>
+</body>
+
+</html>

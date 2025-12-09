@@ -1,10 +1,32 @@
-fastapi[all]
-ollama
-streamlit
-requests
-langchain
-langchain-community
-chromadb
-sentence-transformers
-pypdf
-langchain-chroma
+# ==================================================
+# Neurosymbolic Medical Triage Bot - Dependencies
+# ==================================================
+# Generato il 2025-12-07 - Versioni bloccate per stabilità
+
+# --- Core Framework ---
+fastapi[all]==0.119.0
+pydantic==2.12.2
+
+# --- LLM & Embeddings ---
+ollama==0.6.0
+sentence-transformers==5.1.2
+
+# --- Vector DB ---
+chromadb==1.3.5
+langchain==0.3.27
+langchain-community>=0.3.0
+langchain-chroma==0.2.6
+
+# --- PDF Processing ---
+pypdf==6.3.0
+pymupdf>=1.24.0
+pdfplumber==0.11.8
+
+# --- UI ---
+streamlit==1.50.0
+
+# --- Utilities ---
+requests==2.32.5
+pillow==11.3.0
+numpy==2.0.2
+filelock>=3.0.0

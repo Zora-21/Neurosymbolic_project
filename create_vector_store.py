@@ -1,18 +1,19 @@
 import os
 import shutil
-import argparse # Per accettare argomenti da linea di comando
-from langchain_community.document_loaders import PyPDFLoader
+import argparse
+from langchain_community.document_loaders import PDFPlumberLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.embeddings import SentenceTransformerEmbeddings
 from langchain_chroma import Chroma
+from app.config import EMBEDDING_MODEL
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = SCRIPT_DIR # Dato che è già nella root
+PROJECT_ROOT = SCRIPT_DIR 
 
 BASE_DOCS_PATH = os.path.join(PROJECT_ROOT, "documenti_medici")
 BASE_DB_PATH = os.path.join(PROJECT_ROOT, "vector_dbs")
 
-def create_specialist_vector_store(specialty: str):
+def create_specialist_vector_store(specialty: str, limit: int = 0):
     """
     Crea o ricrea il database vettoriale per una specifica specializzazione medica.
     """
@@ -39,8 +40,9 @@ def create_specialist_vector_store(specialty: str):
 
     print(f"Caricamento di {len(pdf_files)} file PDF per '{specialty}'...")
     for pdf_file in pdf_files:
+        print(f"   Processing: {pdf_file}...")
         try:
-            loader = PyPDFLoader(os.path.join(docs_path, pdf_file))
+            loader = PDFPlumberLoader(os.path.join(docs_path, pdf_file))
             loaded_docs = loader.load()
             # Aggiungi metadati per sapere da quale file proviene il chunk
             for doc in loaded_docs:
@@ -57,9 +59,17 @@ def create_specialist_vector_store(specialty: str):
     print("Suddivisione dei documenti in chunk...")
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
     chunks = text_splitter.split_documents(all_docs)
+    
+    # LIMIT CHECK
+    if limit and limit > 0:
+        print(f"⚠️ LIMIT MODE: Processing only first {limit} chunks.")
+        chunks = chunks[:limit]
 
-    print("Creazione degli embedding e del Vector Store...")
-    embedding_function = SentenceTransformerEmbeddings(model_name="all-MiniLM-L6-v2")
+    print(f"Creazione degli embedding e del Vector Store per {len(chunks)} chunks...")
+    embedding_function = SentenceTransformerEmbeddings(
+        model_name=EMBEDDING_MODEL,
+        encode_kwargs={'normalize_embeddings': True}
+    )
 
     try:
         db = Chroma.from_documents(
@@ -75,10 +85,11 @@ def create_specialist_vector_store(specialty: str):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Crea un database vettoriale per una specializzazione medica.")
     parser.add_argument("specialty", type=str, help="Nome della specializzazione (deve corrispondere a una sottocartella in 'documenti'). Es: 'cardiologia'")
+    parser.add_argument("--limit", type=int, default=0, help="Limita il numero di chunk da processare (per test). 0 = tutti.")
     
     args = parser.parse_args()
     
     # Crea la cartella base per i DB se non esiste
     os.makedirs(BASE_DB_PATH, exist_ok=True)
     
-    create_specialist_vector_store(args.specialty.lower()) # Usa lowercase per coerenza
+    create_specialist_vector_store(args.specialty.lower(), limit=args.limit) # Usa lowercase per coerenza

@@ -2,104 +2,74 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List, Dict, Optional, Any
 import os
-import json
-import threading # Per il thread di pulizia
-import time      # Per il thread di pulizia
-from datetime import datetime, timedelta # Per controllare l'inattività
+import threading 
+import time      
 
-# Import Agenti e Handler
+# --- IMPORTS DEL PROGETTO ---
 from app.agents.router_agent import RouterAgent
 from app.agents.specialist_agent import SpecialistAgent
+from app.agents.assistant_agent import AssistantAgent
 from app.logic.rag_handler import RAGHandler
 from app.logic.symbolic_engine import TriageEngine
-# Potresti voler importare la tua config qui se l'hai creata
-# from app.config import ...
+# Importiamo il gestore di sessione
+from app.logic.session_manager import SessionManager 
+
+from app.logic.image_analyzer import ImageAnalyzer
+from app.logger import get_api_logger
+from app.translations import get_translation, DEFAULT_LANGUAGE
+
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+
+# Logger per questo modulo
+logger = get_api_logger()
 
 # --- SETUP APPLICAZIONE ---
 app = FastAPI(title="Multi-Agent Conversational RAG Triage Bot API")
 
-# --- Percorso Relativo per i DB (Corretto) ---
+# --- CONFIGURAZIONE PERCORSI ---
+# Calcoliamo i percorsi assoluti per evitare errori "File not found"
 MAIN_PY_DIR = os.path.dirname(os.path.abspath(__file__)) 
 PROJECT_ROOT = os.path.dirname(MAIN_PY_DIR) 
+VECTOR_DB_PATH = os.path.join(PROJECT_ROOT, "vector_dbs") 
 
-# --- ERRORE PRECEDENTE CORRETTO: Percorso per RAG Handler ---
-# Questo è il percorso che passeremo al RAGHandler
-CORRECT_BASE_DB_PATH = os.path.join(PROJECT_ROOT, "vector_dbs") 
+# Mount Static Files
+app.mount("/static", StaticFiles(directory=os.path.join(MAIN_PY_DIR, "static")), name="static")
 
+# --- RILEVAMENTO SPECIALISTI DISPONIBILI ---
 AVAILABLE_SPECIALISTS = []
-if os.path.exists(CORRECT_BASE_DB_PATH):
+if os.path.exists(VECTOR_DB_PATH):
     try:
         AVAILABLE_SPECIALISTS = [
-            d for d in os.listdir(CORRECT_BASE_DB_PATH)
-            if os.path.isdir(os.path.join(CORRECT_BASE_DB_PATH, d)) and not d.startswith('.')
+            d.lower() for d in os.listdir(VECTOR_DB_PATH)
+            if os.path.isdir(os.path.join(VECTOR_DB_PATH, d)) and not d.startswith('.')
         ]
-        AVAILABLE_SPECIALISTS = [s.lower() for s in AVAILABLE_SPECIALISTS]
     except Exception as e:
-        print(f"❌ Errore durante la lettura delle cartelle degli specialisti in {CORRECT_BASE_DB_PATH}: {e}")
+        logger.error(f"Errore lettura directory vector_dbs: {e}")
 
 if not AVAILABLE_SPECIALISTS:
-    print(f"⚠️ ATTENZIONE: Nessun database vettoriale valido trovato in '{CORRECT_BASE_DB_PATH}'.")
+    logger.warning(f"Nessun DB vettoriale trovato in '{VECTOR_DB_PATH}'.")
 else:
-     print(f"✅ Specialisti disponibili rilevati: {AVAILABLE_SPECIALISTS}")
+     logger.info(f"Specialisti attivi: {AVAILABLE_SPECIALISTS}")
 
-# --- Inizializzazione Handler e Agenti (Corretta) ---
-# Inietta il percorso corretto nel RAGHandler
-rag_handler = RAGHandler(base_db_path=CORRECT_BASE_DB_PATH) 
+# --- INIZIALIZZAZIONE COMPONENTI ---
+logger.info("Inizializzazione Motori IA...")
+rag_handler = RAGHandler(base_db_path=VECTOR_DB_PATH) 
 triage_engine = TriageEngine()
 router_agent = RouterAgent(available_specialists=AVAILABLE_SPECIALISTS)
+assistant_agent = AssistantAgent() # Agente Scriba
+image_analyzer = ImageAnalyzer() # Inizializza Analizzatore Immagini
+session_manager = SessionManager() # Inizializza Gestore Sessioni
+
+# Cache per le istanze degli specialisti (per non ricrearli ad ogni chiamata)
 specialist_agents_instances = {}
 
-
-# --- *** MODIFICA: GESTIONE STATO SESSIONE CON TIMESTAMP *** ---
-
-# La sessione ora contiene lo stato E il timestamp dell'ultimo accesso
-# Esempio: "session_id_xyz": { "state": {...}, "last_access_time": datetime_obj }
-global_sessions: Dict[str, Dict[str, Any]] = {}
-
-# Lock per rendere la modifica di global_sessions thread-safe
-# (sicuro da usare sia dall'API che dal thread di pulizia)
-session_lock = threading.Lock()
-
-def get_default_session_state() -> Dict[str, Any]:
-    """Ritorna uno stato di sessione pulito."""
-    return {
-        "current_agent": "router",
-        "chat_history": [],
-        "last_summary": None
-    }
-
-def get_session(session_id: str) -> Dict[str, Any]:
-    """
-    Recupera lo stato della sessione per un dato ID.
-    Se non esiste, ne crea una nuova.
-    Aggiorna il timestamp di ultimo accesso.
-    """
-    with session_lock: # Blocca l'accesso mentre leggiamo/scriviamo
-        if session_id not in global_sessions:
-            print(f"Creazione nuova sessione: {session_id}")
-            global_sessions[session_id] = {
-                "state": get_default_session_state(),
-                "last_access_time": datetime.utcnow() # Usa UTC per coerenza
-            }
-        else:
-            # Aggiorna il timestamp perché c'è stata attività
-            global_sessions[session_id]["last_access_time"] = datetime.utcnow()
-            
-        return global_sessions[session_id]["state"] # Ritorna solo lo stato
-
-def delete_session(session_id: str):
-    """Rimuove in sicurezza una sessione."""
-    with session_lock:
-        if session_id in global_sessions:
-            del global_sessions[session_id]
-            print(f"Sessione {session_id} rimossa.")
-# --- *** FINE MODIFICA STATO *** ---
-
-
-# --- MODELLI DATI Pydantic (Invariati) ---
+# --- MODELLI DATI API (Pydantic) ---
 class UserMessage(BaseModel):
     message: str
     session_id: str
+    image_data: Optional[str] = None  # Base64 string
+    language: Optional[str] = "en"  # "en" or "it", default English
 
 class ResetRequest(BaseModel):
     session_id: Optional[str] = None
@@ -110,186 +80,357 @@ class AgentResponse(BaseModel):
     is_final: bool = False
     referto: Optional[List[Dict]] = None
     sources: Optional[List[str]] = None
+    extracted_info: Optional[Dict] = None
+    extra_messages: Optional[List[Dict]] = None
+    patient_data: Optional[Dict] = None
 
-# --- FUNZIONE HELPER (Invariata) ---
-def get_specialist_agent(specialist_name: str) -> Optional[SpecialistAgent]:
-    specialist_name_lower = specialist_name.lower()
-    if specialist_name_lower not in AVAILABLE_SPECIALISTS:
+# --- FUNZIONI HELPER ---
+def get_specialist_agent(specialist_name: str, language: str = "en") -> Optional[SpecialistAgent]:
+    """Factory per ottenere o creare l'agente specialista richiesto."""
+    name_lower = specialist_name.lower()
+    if name_lower not in AVAILABLE_SPECIALISTS:
         return None
-    if specialist_name_lower not in specialist_agents_instances:
-        specialist_agents_instances[specialist_name_lower] = SpecialistAgent(
-            specialist_name_lower, rag_handler, triage_engine
+    
+    if name_lower not in specialist_agents_instances:
+        specialist_agents_instances[name_lower] = SpecialistAgent(
+            name_lower, rag_handler, triage_engine, language=language
         )
-    return specialist_agents_instances[specialist_name_lower]
+    else:
+        # Aggiorna la lingua se già esiste
+        specialist_agents_instances[name_lower].set_language(language)
+    return specialist_agents_instances[name_lower]
 
-# --- ENDPOINT API PRINCIPALE (Modificato per aggiornare timestamp) ---
+# --- BACKGROUND TASK: PULIZIA SESSIONI ---
+# --- BACKGROUND TASK: PULIZIA SESSIONI ---
+# TODO: Implementare cleanup in SessionManager se necessario
+# def background_cleanup_task():
+#     """Thread che gira ogni 15 min per pulire le sessioni scadute."""
+#     print("🧹 Avvio thread di pulizia sessioni background...")
+#     while True:
+#         time.sleep(900) # 900 secondi = 15 minuti
+#         try:
+#             # session_manager.cleanup_expired_sessions()
+#             pass
+#         except Exception as e:
+#             print(f"❌ Errore nel thread di pulizia: {e}")
+# 
+# # Avvia il thread come demone (si chiude se l'app si chiude)
+# # cleanup_thread = threading.Thread(target=background_cleanup_task, daemon=True)
+# # cleanup_thread.start()
+
+
+# --- ENDPOINT: CHAT PRINCIPALE ---
 @app.post("/chat", response_model=AgentResponse)
 async def handle_chat(user_message: UserMessage):
     """
-    Gestisce un messaggio dell'utente per una sessione specifica.
-    L'accesso aggiorna il timestamp di ultimo accesso della sessione.
+    Gestisce il flusso conversazionale.
+    1. Recupera stato sessione da SQLite.
+    2. Esegue logica Agente (Router o Specialista).
+    3. Salva nuovo stato su SQLite (o cancella se finito).
     """
-    # *** MODIFICA: get_session ora aggiorna automaticamente il timestamp ***
-    session_state = get_session(user_message.session_id)
-    print(f"Gestione chat per sessione: {user_message.session_id} (Agente: {session_state['current_agent']})")
-    
-    # ... (Tutta la logica di /chat rimane invariata) ...
-    # ... (Aggiungi la tua logica per router/specialista qui) ...
-    
-    session_state["chat_history"].append({"role": "user", "content": user_message.message})
+    session_id = user_message.session_id
+
+    # 1. Recupera la sessione dal DB
+    session_state = session_manager.load_session(session_id)
+
+    # Gestione Reset
+    if user_message.message == "/reset":
+        session_state = {
+            "chat_history": [],
+            "current_agent": "router",
+            "last_summary": "",
+            "asked_questions": [],
+            "language": user_message.language or DEFAULT_LANGUAGE
+        }
+        session_manager.save_session(session_id, session_state)
+        # Resetta anche i dati clinici
+        assistant_agent._save_data(session_id, {
+            "symptoms": [], "duration": [], "negative_findings": [],
+            "medical_history": [], "medications": [], "allergies": [],
+            "vital_signs": {}, "notes": ""
+        })
+        lang = session_state.get("language", DEFAULT_LANGUAGE)
+        return AgentResponse(
+            response=get_translation(lang, "session_reset"),
+            agent_type="system",
+            is_final=False,
+            patient_data={}
+        )
+
+    # Gestione Diagnosi Forzata
+    if user_message.message == "/diagnose":
+        try:
+            if session_state["current_agent"] in AVAILABLE_SPECIALISTS:
+                logger.warning(f"DIAGNOSI FORZATA RICHIESTA (Sessione: {session_id})")
+                active_specialist = get_specialist_agent(session_state["current_agent"])
+                
+                # Genera un sommario al volo dai messaggi utente
+                summary_forced = " ".join([m['content'] for m in session_state["chat_history"] if m['role'] == 'user'])
+                
+                # Carica i dati del paziente (senza aggiornarli con "/diagnose")
+                patient_data = assistant_agent._load_data(session_id)
+
+                # Forza l'analisi
+                triage_result = active_specialist.perform_analysis_and_triage(summary_forced, {}, patient_data)
+                
+                if triage_result.get("type") == "triage_result":
+                    data = triage_result.get("data", {})
+                    
+                    # Build final response
+                    md_response = f"**FORCED DIAGNOSIS (Outcome: {data.get('livello', 'N/A')})**\n\n{data.get('messaggio', '')}"
+                    if data.get("tool_report"):
+                        md_response += f"\n{data.get('tool_report')}"
+                    
+                    if data.get("referto"):
+                        md_response += "\n\n---\n### Clinical Hypotheses (AI)\n"
+                        for item in data.get("referto"):
+                            md_response += f"- **{item.get('condition')}** ({item.get('probability')})\n  _{item.get('reasoning')}_\n"
+
+                    # Resetta sessione dopo diagnosi
+                    session_manager.save_session(session_id, {
+                        "chat_history": [], "current_agent": "router", "last_summary": "", "asked_questions": []
+                    })
+                    
+                    return AgentResponse(
+                        response=md_response,
+                        agent_type=session_state["current_agent"],
+                        is_final=True,
+                        referto=data.get("referto"),
+                        sources=data.get("sources_consulted"),
+                        patient_data=patient_data
+                    )
+            else:
+                return AgentResponse(
+                    response="You must be in contact with a specialist to force a diagnosis.",
+                    agent_type="system",
+                    is_final=False
+                )
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return AgentResponse(
+                response=f"Error during forced diagnosis: {str(e)}",
+                agent_type="system",
+                is_final=False
+            )
+
+    logger.info(f"Messaggio ricevuto (Sessione: {session_id[:8]}...) - Agente attuale: {session_state['current_agent']}")
+
+    # --- GESTIONE LINGUA ---
+    # Salva la lingua nella sessione (la prima volta o quando cambia)
+    request_lang = user_message.language or DEFAULT_LANGUAGE
+    if "language" not in session_state or session_state["language"] != request_lang:
+        session_state["language"] = request_lang
+        # Aggiorna la lingua degli agenti
+        router_agent.set_language(request_lang)
+        assistant_agent.set_language(request_lang)
+    lang = session_state.get("language", DEFAULT_LANGUAGE)
+
+    # --- GESTIONE IMMAGINE ---
+    image_context = ""
+    if user_message.image_data:
+        logger.info("Immagine ricevuta. Avvio analisi...")
+        image_description = image_analyzer.analyze_image(user_message.image_data)
+        image_context = f"\n\n[SYSTEM NOTE: User uploaded an image. Visual analysis detects: {image_description}]"
+        # Add analysis to history as system message
+        session_state["chat_history"].append({"role": "system", "content": f"User Image Analysis: {image_description}"})
+
+    # Aggiungi messaggio utente alla cronologia (con eventuale contesto immagine appeso per chiarezza)
+    full_user_message = user_message.message + image_context
+    session_state["chat_history"].append({"role": "user", "content": full_user_message})
     current_history = session_state["chat_history"]
 
-    agent_response_content = "Mi dispiace, si è verificato un errore imprevisto."
+    # --- AGENTE ASSISTENTE (SCRIBA) ---
+    # Aggiorna i dati del paziente in background
+    logger.info("Assistant Agent: Analisi messaggio utente...")
+    
+    # Recupera l'ultimo messaggio dell'agente per il contesto (se esiste)
+    last_agent_msg = None
+    if session_state["chat_history"]:
+        for msg in reversed(session_state["chat_history"][:-1]): # Escludi l'ultimo che è l'utente
+            if msg["role"] == "assistant":
+                last_agent_msg = msg["content"]
+                break
+
+    patient_data = assistant_agent.update_patient_data(session_id, user_message.message, last_agent_msg)
+
+    # Response variables
+    agent_response_content = "Unexpected error."
     agent_type = session_state["current_agent"]
     is_final = False
     referto_data = None
     sources_data = None
-    active_agent_name = session_state["current_agent"]
+    extracted_info = None
+    extra_messages = None  # Inizializzazione sicura
 
     try:
-        if active_agent_name == "router":
-            router_decision = router_agent.decide_routing(current_history)
+        # --- CASO 1: ROUTER (Smistamento) ---
+        if agent_type == "router":
+            router_decision = router_agent.decide_routing(current_history, patient_data)
             action = router_decision.get("action")
+
             if action == "ask_general_followup":
                 agent_response_content = router_decision.get("question")
-                agent_type = "router"
-            elif action == "cannot_route":
-                agent_response_content = router_decision.get("message")
-                agent_type = "router"; is_final = True
+                # Rimaniamo sul router
+            
             elif action == "route_to_specialist":
                 specialist_name = router_decision.get("specialist").lower()
                 summary = router_decision.get("summary")
-                specialist_agent = get_specialist_agent(specialist_name)
-                if not specialist_agent:
-                    agent_response_content = f"Errore: specialista '{specialist_name}' non trovato."
-                    agent_type = "system"; is_final = True
-                else:
+                
+                # Verifichiamo che lo specialista esista
+                if get_specialist_agent(specialist_name, lang):
                     session_state["current_agent"] = specialist_name
                     session_state["last_summary"] = summary
                     agent_type = specialist_name
-                    agent_response_content = f"La metto in contatto con l'assistente **{specialist_name.capitalize()}**..."
-            else:
-                agent_response_content = "Errore durante lo smistamento."; agent_type = "system"; is_final = True
+                    
+                    # 1. Router Message (Transition) - tradotto
+                    router_msg = get_translation(lang, "connecting_specialist", specialist=specialist_name.capitalize())
+                    session_state["chat_history"].append({"role": "assistant", "agent": "router", "content": router_msg})
+                    
+                    # 2. Specialist Message (Greeting) - tradotto
+                    agent_response_content = get_translation(lang, "specialist_greeting")
+                    
+                    # Prepare extra messages for frontend
+                    extra_messages = [{"role": "assistant", "agent": "router", "content": router_msg}]
+                else:
+                    agent_response_content = get_translation(lang, "specialist_unavailable", specialist=specialist_name)
+                    is_final = True  # Close if critical routing error
 
-        elif active_agent_name in AVAILABLE_SPECIALISTS:
-            specialist_agent = get_specialist_agent(active_agent_name)
-            specialist_decision = specialist_agent.decide_next_action(current_history)
-            action = specialist_decision.get("action")
+            elif action == "cannot_route":
+                agent_response_content = router_decision.get("message", get_translation(lang, "cannot_route"))
+                is_final = True
+            
+            else:
+                agent_response_content = get_translation(lang, "did_not_understand")
+
+        # --- CASO 2: SPECIALISTA (Analisi) ---
+        elif agent_type in AVAILABLE_SPECIALISTS:
+            active_specialist = get_specialist_agent(agent_type, lang)
+            
+            # Decide se chiedere altro o fare triage
+            asked_questions = session_state.get("asked_questions", [])
+            decision = active_specialist.decide_next_action(current_history, patient_data, asked_questions)
+            action = decision.get("action")
 
             if action == "ask_specialist_followup":
-                agent_response_content = specialist_decision.get("question")
-                agent_type = active_agent_name; is_final = False
+                question = decision.get("question")
+                agent_response_content = question
+                is_final = False
+                
+                # Salviamo la domanda fatta per evitare ripetizioni
+                if question:
+                    session_state["asked_questions"].append(question)
+
             elif action == "perform_triage":
-                summary = specialist_decision.get("summary", session_state.get("last_summary"))
-                extracted_data = specialist_decision.get("extracted_data", {})
-                triage_result = triage_result = specialist_agent.perform_analysis_and_triage(summary, extracted_data)
+                # Recupera dati per l'analisi
+                summary = decision.get("summary", session_state.get("last_summary"))
+                extracted_data = decision.get("extracted_data", {})
+                
+                # Esegue RAG + Logica Simbolica (Passiamo anche i dati del paziente!)
+                triage_result = active_specialist.perform_analysis_and_triage(summary, extracted_data, patient_data)
+
                 if triage_result.get("type") == "triage_result":
-                    triage_data = triage_result.get("data", {})
-                    livello = triage_data.get("livello", "N/D")
-                    messaggio = triage_data.get("messaggio", "Analisi completata.")
+                    data = triage_result.get("data", {})
+                    
+                    livello = data.get("livello", "N/A")
+                    messaggio = data.get("messaggio", "Analysis complete.")
+                    tool_report = data.get("tool_report", "")
+                    referto_data = data.get("referto", [])
+                    sources_data = data.get("sources_consulted", [])
 
-                    # --- RIGA DA AGGIUNGERE ---
-                    tool_report_md = triage_data.get("tool_report", "") # Prendiamo il report dei tool
-                    # ---------------------------
-
-                    referto_data = triage_data.get("referto", [])
-                    sources_data = triage_data.get("sources_consulted", [])
-                    referto_md = ""
+                    # Build final Markdown response
+                    md_response = f"**Outcome: {livello}**\n\n{messaggio}"
+                    if tool_report:
+                        md_response += f"\n{tool_report}"
+                    
+                    # Aggiungi referto al markdown (spostato PRIMA del return)
                     if referto_data:
-                         referto_md += "\n\n---\n### Ipotesi Preliminari (Non Diagnosi)\n"
-                         referto_md += f"*Basandomi sulle informazioni e sulle fonti della mia specializzazione ({active_agent_name.capitalize()})...*\n"
-                         for item in referto_data:
-                              motivazione = item.get('reasoning') or item.get('rationale') or 'N/A'
-                              referto_md += f"\n- **{item.get('condition','N/A')}** (Probabilità: {item.get('probability','N/A')})\n  - *Motivazione:* {motivazione}\n"
-                    agent_response_content = f"**{livello}**\n\n{messaggio}" + tool_report_md + referto_md
-                    is_final = True
+                        md_response += "\n\n---\n### Clinical Hypotheses (AI)\n"
+                        for item in referto_data:
+                            nome = item.get('condition', 'N/A')
+                            prob = item.get('probability', 'N/A')
+                            reason = item.get('reasoning', '')
+                            md_response += f"- **{nome}** ({prob})\n  _{reason}_\n"
+                    
+                    agent_response_content = md_response
+                    is_final = True  # Triage completato
+                    
+                    # Passiamo i dati estratti alla risposta API
+                    return AgentResponse(
+                        response=agent_response_content,
+                        agent_type=agent_type,
+                        is_final=is_final,
+                        referto=referto_data,
+                        sources=sources_data,
+                        extracted_info=extracted_data,
+                        extra_messages=extra_messages,
+                        patient_data=patient_data
+                    )
                 else:
-                    agent_response_content = "Errore durante l'analisi finale."; is_final = True
+                    agent_response_content = "An error occurred during report generation."
+                    is_final = True
             else:
-                 agent_response_content = "Errore assistente specializzato."; is_final = True
-            agent_type = active_agent_name
-        
+                agent_response_content = "I didn't understand. Try again."
+
         else:
-            agent_response_content = "Errore di Stato. Resettare."; agent_type = "system"; is_final = True
+            # Inconsistent state (e.g., agent removed)
+            agent_response_content = "Session state error. Please restart."
+            is_final = True
 
     except Exception as e:
-        agent_response_content = f"Errore generale: {e}"; agent_type = "system"; is_final = True
-    
+        logger.error(f"CRITICAL ERROR in /chat: {e}")
+        agent_response_content = "A technical error occurred on the server."
+        is_final = True
+
+    # Aggiungi risposta assistente alla storia
     session_state["chat_history"].append({"role": "assistant", "content": agent_response_content})
 
-    # --- MODIFICA: Rimuovi la sessione se è finale ---
+    # 3. SALVATAGGIO O CANCELLAZIONE SESSIONE
+    # 3. SALVATAGGIO O CANCELLAZIONE SESSIONE
     if is_final:
-        print(f"--- Conversazione Conclusa (Sessione: {user_message.session_id}) ---")
-        delete_session(user_message.session_id) # Rimuove la sessione dalla memoria
+        logger.info(f"Sessione conclusa: {session_id}")
+        # Per ora resettiamo solo lo stato in memoria/file
+        session_state = {
+            "chat_history": [],
+            "current_agent": "router",
+            "last_summary": "",
+            "asked_questions": []
+        }
+        session_manager.save_session(session_id, session_state)
+    else:
+        session_manager.save_session(session_id, session_state)
 
     return AgentResponse(
         response=agent_response_content,
         agent_type=agent_type,
         is_final=is_final,
         referto=referto_data,
-        sources=sources_data
+        sources=sources_data,
+        extra_messages=extra_messages,
+        patient_data=patient_data
     )
 
-# --- Endpoint Ausiliari (Modificato) ---
+# --- ALTRI ENDPOINT ---
 @app.post("/reset")
-def reset_session(request: ResetRequest):
-    """Resetta (elimina) una specifica sessione utente nel backend."""
-    session_id = request.session_id
-    if session_id:
-        print(f"--- Reset Manuale della Sessione Richiesto (Sessione: {session_id}) ---")
-        delete_session(session_id) # Usa la funzione thread-safe
-        return {"message": f"Stato della sessione {session_id} resettato con successo."}
-    return {"message": "Sessione non trovata o ID non fornito."}
+def reset_session_endpoint(request: ResetRequest):
+    """Resetta manualmente una sessione."""
+    if request.session_id:
 
+        # Reset manuale
+        empty_state = {
+            "chat_history": [],
+            "current_agent": "router",
+            "last_summary": "",
+            "asked_questions": []
+        }
+        session_manager.save_session(request.session_id, empty_state)
+        return {"message": f"Sessione {request.session_id} resettata."}
+    return {"message": "ID sessione mancante."}
 
 @app.get("/")
 def read_root():
-    return {"status": f"Server Multi-Agente attivo! Specialisti: {AVAILABLE_SPECIALISTS}"}
+    return FileResponse(os.path.join(MAIN_PY_DIR, "static", "index.html"))
 
-
-# --- *** NUOVA SEZIONE: PULIZIA AUTOMATICA SESSIONI IN BACKGROUND *** ---
-
-SESSION_EXPIRATION_MINUTES = 60
-CLEANUP_INTERVAL_SECONDS = 900 # 15 minuti
-
-def cleanup_inactive_sessions():
-    """
-    Scansiona global_sessions e rimuove le sessioni inattive
-    da più di SESSION_EXPIRATION_MINUTES.
-    """
-    print(f"[{datetime.utcnow()}] Esecuzione pulizia sessioni inattive...")
-    expiration_time = datetime.utcnow() - timedelta(minutes=SESSION_EXPIRATION_MINUTES)
-    
-    # Crea una lista di sessioni da eliminare per evitare di modificare
-    # il dizionario mentre lo si sta iterando
-    sessions_to_delete = []
-    
-    with session_lock: # Blocca l'accesso
-        for session_id, data in global_sessions.items():
-            if data["last_access_time"] < expiration_time:
-                sessions_to_delete.append(session_id)
-
-        # Ora elimina le sessioni scadute
-        for session_id in sessions_to_delete:
-            del global_sessions[session_id]
-            print(f"Pulizia: Sessione {session_id} scaduta e rimossa.")
-            
-    print(f"Pulizia terminata. Sessioni attive: {len(global_sessions)}")
-
-def background_cleanup_task():
-    """
-    Funzione eseguita in un thread separato che chiama
-    la pulizia a intervalli regolari.
-    """
-    print("Avvio del thread di pulizia sessioni in background...")
-    while True:
-        try:
-            time.sleep(CLEANUP_INTERVAL_SECONDS)
-            cleanup_inactive_sessions()
-        except Exception as e:
-            print(f"Errore nel thread di pulizia: {e}")
-
-# Avvia il thread di pulizia quando l'applicazione FastAPI parte
-# 'daemon=True' assicura che il thread si chiuda quando il programma principale (FastAPI) si ferma
-cleanup_thread = threading.Thread(target=background_cleanup_task, daemon=True)
-cleanup_thread.start()
+@app.get("/favicon.ico")
+async def favicon():
+    return FileResponse(os.path.join(MAIN_PY_DIR, "static", "favicon.ico")) if os.path.exists(os.path.join(MAIN_PY_DIR, "static", "favicon.ico")) else None

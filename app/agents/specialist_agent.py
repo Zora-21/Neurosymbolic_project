@@ -1,216 +1,397 @@
 import ollama
 import json
+from typing import Dict, Any, List, Optional
 
-from app.config import LLM_MODEL
+from app.config import LLM_MODEL, DEFAULT_LANGUAGE
 from app.tools import medical_calculators
+from app.models import MedicalAnalysis
+from app.logger import get_agent_logger
+from app.translations import SPECIALIST_DECIDE_PROMPTS, get_translation
 
-model=LLM_MODEL
+# Logger per questo modulo
+logger = get_agent_logger()
+
+model = LLM_MODEL
 
 class SpecialistAgent:
-    def __init__(self, specialty: str, rag_handler, triage_engine):
+    def __init__(self, specialty: str, rag_handler, triage_engine, language: str = DEFAULT_LANGUAGE):
         """
         Inizializza un agente specialista conversazionale con Riflessione.
         """
         self.specialty = specialty.lower()
         self.rag_handler = rag_handler
         self.triage_engine = triage_engine
-        # Prompt per decidere l'azione (chiedere o analizzare)
-        self.decide_action_prompt = f"""
-        Sei un assistente medico specializzato in {self.specialty.upper()}. Dialoga con l'utente per approfondire i sintomi.
-        Analizza la cronologia e decidi:
-        1. Se servono dettagli SPECIFICI per {self.specialty}, fai UNA domanda mirata. JSON: {{"action": "ask_specialist_followup", "question": "..."}}
-        2. Se hai abbastanza info per l'analisi RAG, avvia il triage. JSON: {{"action": "perform_triage", "summary": "Riassunto completo...", "extracted_data": {{"temperature_celsius": 39.5, "pain_score": 8, "systolic": 130, "diastolic": 90}} }}
-        Se l'utente ha fornito dati numerici specifici (temperatura, punteggio dolore 0-10, pressione), inseriscili nell'oggetto "extracted_data". Altrimenti, lascia "extracted_data" come oggetto vuoto {{}}.
-        Rispondi SOLO con il JSON richiesto.
-        """
-        # Prompt per il passo di Riflessione
-        self.reflection_prompt_template = """
-        Sei un supervisore medico esperto in {specialty_upper}. Revisiona l'analisi preliminare JSON ("initial_analysis") basata sui sintomi riassunti ("symptoms_summary").
+        self.language = language
         
-        Il tuo compito è restituire un JSON raffinato. Le tue regole sono:
-        1.  Valuta l'analisi iniziale: è corretta? È pertinente ai sintomi? (es. "Deformidade" per "tosse e febbre" è ERRATO).
-        2.  Se l'analisi iniziale è buona, restituiscila.
-        3.  Se l'analisi iniziale è errata, irrilevante o incompleta, DEVI correggerla o crearne una nuova basandoti TU sui sintomi riassunti.
-        4.  Se crei nuove condizioni (es. 'Bronchite acuta', 'Pneumonia'), DEVI formattarle correttamente.
+        # Prompt to decide action (ask or analyze) - loaded from translations
+        self._update_prompt()
+        
+    def set_language(self, language: str):
+        """Aggiorna la lingua dello specialista dinamicamente."""
+        if language in ["en", "it"]:
+            self.language = language
+            self._update_prompt()
+    
+    def _update_prompt(self):
+        """Ricarica il prompt nella lingua corrente."""
+        base_prompt = SPECIALIST_DECIDE_PROMPTS.get(self.language, SPECIALIST_DECIDE_PROMPTS["en"])
+        self.decide_action_prompt = base_prompt.format(specialty=self.specialty.upper())
+        
+        # Prompt for Reflection step
+        self.reflection_prompt_template = """
+        You are an expert medical supervisor in {specialty_upper}. Review the preliminary JSON analysis ("initial_analysis") based on summarized symptoms ("symptoms_summary").
+        
+        Your task is to return a refined JSON. Your rules are:
+        1. Evaluate the initial analysis: is it correct? Is it relevant to the symptoms?
+        2. If the initial analysis is good, return it.
+        3. If the initial analysis is incorrect, irrelevant, or incomplete (or EMPTY), YOU MUST correct it or create a new one.
+        4. CRITICAL: If "potential_conditions" is empty, USE YOUR GENERAL MEDICAL KNOWLEDGE to formulate at least 3 plausible hypotheses based on symptoms, marking them as "Low" or "Medium" probability. NEVER RETURN AN EMPTY LIST.
+        
+        IMPORTANT NOTE ON LANGUAGE:
+        - The retrieved medical context (RAG) might be in SPANISH or ENGLISH.
+        - YOU MUST analyze it, translate mentally, and respond EXCLUSIVELY IN ENGLISH.
+        - If the context is hard to interpret, prioritize SYMPTOMS and use your general knowledge.
 
-        Il formato di output DEVE essere ESCLUSIVAMENTE un oggetto JSON con la chiave "potential_conditions",
-        che è una lista di oggetti. Ogni oggetto DEVE avere:
-        - "condition": Nome della condizione (es. "Bronchite acuta").
-        - "probability": Probabilità ("Alta", "Media", "Bassa").
-        - "reasoning": Spiegazione (max 2 frasi) che collega i SINTOMI alla condizione.
+        The output format MUST be EXCLUSIVELY a JSON object with the key "potential_conditions",
+        which is a list of objects. Each object MUST have:
+        - "condition": Condition name (e.g., "Acute Bronchitis").
+        - "probability": Probability ("High", "Medium", "Low").
+        - "reasoning": Explanation (max 2 sentences).
 
-        Sintomi Riepilogati: {symptoms_summary}
-        Analisi Preliminare da Revisionare:
+        Summarized Symptoms: {symptoms_summary}
+        Preliminary Analysis:
         ```json
         {initial_analysis_json}
         ```
-        Fornisci il JSON raffinato:
+        Refined JSON:
         """
 
-    def decide_next_action(self, chat_history: list) -> dict:
+    def decide_next_action(self, chat_history: list, patient_data: dict = None, asked_questions: list = None) -> dict:
         """
         Decide se fare un'altra domanda specifica o avviare l'analisi finale.
-        (Codice identico alla versione precedente)
         """
-        messages = [{'role': 'system', 'content': self.decide_action_prompt}]
-        messages.extend(chat_history[-6:]) # Considera una finestra di contesto
+        # Costruiamo il contesto dei dati paziente
+        patient_context = ""
+        if patient_data:
+            patient_context = f"\nDATI PAZIENTE CONOSCIUTI:\n{json.dumps(patient_data, indent=2, ensure_ascii=False)}\n"
+            patient_context += "NOTA: NON chiedere informazioni già presenti qui sopra (es. se c'è già la temperatura, non chiederla).\n"
+
+        # Costruiamo il contesto delle domande già fatte
+        asked_context = ""
+        if asked_questions:
+            asked_context = f"\nDOMANDE GIÀ FATTE (VIETATO RIPETERE):\n" + "\n".join(f"- {q}" for q in asked_questions) + "\n"
+            asked_context += "CRITICO: Se la tua domanda è simile a una di queste, NON FARLA. Passa al triage o chiedi altro.\n"
+
+        # --- VINCOLI DINAMICI (GLOBAL BLACKLIST) ---
+        known_info_list = []
+        if patient_data:
+            # Raccogli tutte le informazioni note in una lista piatta
+            for key, value in patient_data.items():
+                if isinstance(value, list):
+                    known_info_list.extend([str(v) for v in value])
+                elif isinstance(value, dict):
+                    known_info_list.extend([f"{k}: {v}" for k, v in value.items()])
+                elif value:
+                    known_info_list.append(str(value))
+
+        constraints_str = ""
+        if known_info_list:
+            constraints_str = "\n⛔️ FORBIDDEN TOPICS (ALREADY STATED BY USER):\n" 
+            constraints_str += f"The user has already communicated: {', '.join(known_info_list)}.\n"
+            constraints_str += "DO NOT ASK ANYTHING RELATED TO THESE TOPICS. Look for other information.\n"
+            # Add specific rules if key fields are present
+            if patient_data.get("duration"):
+                constraints_str += "- FORBIDDEN to ask 'how long' or duration.\n"
+            if patient_data.get("symptoms"):
+                constraints_str += "- FORBIDDEN to ask generically 'what are the symptoms'.\n"
+
+        full_system_prompt = self.decide_action_prompt + patient_context + asked_context + constraints_str
+        
+        messages = [{'role': 'system', 'content': full_system_prompt}]
+        messages.extend(chat_history[-12:]) # Finestra di contesto aumentata
 
         try:
             response = ollama.chat(model='llama3:8b', messages=messages, format='json')
             decision = json.loads(response['message']['content'])
 
             action = decision.get("action")
-            # Validazione più robusta
+            
+            # Validazione Azione
             if action == "ask_specialist_followup":
                  if not decision.get("question"):
-                      print(f"⚠️ {self.specialty.upper()} Action 'ask' senza domanda. Tento il triage.")
-                      summary_fallback = " ".join([m['content'] for m in chat_history if m['role'] == 'user'])
-                      return {"action": "perform_triage", "summary": summary_fallback}
+                      # Safe fallback: if question is missing, ask for clarification
+                      return {"action": "ask_specialist_followup", "question": "Could you describe your symptoms better?"}
+                 return decision
+
             elif action == "perform_triage":
-                 if not decision.get("summary"):
-                      print(f"⚠️ {self.specialty.upper()} Action 'triage' senza summary. Tento il triage con fallback.")
+                 summary = decision.get("summary", "")
+                 # Anti-placeholder check
+                 if not summary or summary == "Full summary..." or len(summary) < 10:
+                      logger.warning(f" {self.specialty.upper()} used a placeholder summary. Regenerating from messages.")
+                      # Fallback: regenerate summary from user messages
                       summary_fallback = " ".join([m['content'] for m in chat_history if m['role'] == 'user'])
-                      decision["summary"] = summary_fallback # Correggi decisione
-            else: # Azione non valida
-                print(f"⚠️ {self.specialty.upper()} Agent ha restituito azione non valida: '{action}'. Tento il triage.")
-                summary_fallback = " ".join([m['content'] for m in chat_history if m['role'] == 'user'])
-                return {"action": "perform_triage", "summary": summary_fallback}
+                      decision["summary"] = summary_fallback
+                 return decision
+            
+            else: 
+                # Unknown or invalid action
+                logger.warning(f" {self.specialty.upper()} Unknown Action: '{action}'. Asking for clarification.")
+                return {"action": "ask_specialist_followup", "question": "I'm not sure I understood. Can you give me more details?"}
 
-            print(f"🤖 {self.specialty.upper()} Agent Decision: {action}")
-            return decision
-
-        except Exception as e:
-            print(f"❌ Errore decisione {self.specialty.upper()} Agent: {e}")
-            summary_fallback = " ".join([m['content'] for m in chat_history if m['role'] == 'user'])
-            return {"action": "perform_triage", "summary": summary_fallback}
+        except (json.JSONDecodeError, Exception) as e:
+            logger.error(f" Decision Error {self.specialty.upper()} Agent: {e}. Fallback to generic question.")
+            # IMPORTANT: Do not go to triage on error, it's dangerous. Ask for info.
+            return {"action": "ask_specialist_followup", "question": "Excuse me, I got confused for a moment. Can you repeat the last symptom?"}
 
 
-    def _run_reflection(self, symptoms_summary: str, initial_analysis: dict) -> dict:
+
+    
+    def _run_reflection(self, symptoms_summary: str, initial_analysis: dict, patient_data: dict = None) -> dict:
         """
-        Esegue il passo di Riflessione sull'analisi RAG iniziale.
-        *** MODIFICATO CON VALIDAZIONE ROBUSTA DELLO SCHEMA ***
+        Esegue il passo di Riflessione usando Pydantic per validare la struttura.
         """
-        print(f"🤔 Inizio passo di Riflessione ({self.specialty.upper()})...")
+        logger.info(f" Inizio passo di Riflessione ({self.specialty.upper()})...")
         
-        reflection_system_prompt = self.reflection_prompt_template.format(
-            specialty_upper=self.specialty.upper(),
-            symptoms_summary=symptoms_summary,
-            initial_analysis_json=json.dumps(initial_analysis, indent=2)
-        )
+        # Formattiamo i dati del paziente per il prompt
+        patient_context = ""
+        if patient_data:
+            patient_context = f"Dati Paziente (Storia/Farmaci/Allergie): {json.dumps(patient_data, indent=2)}"
+
+        reflection_system_prompt = f"""
+        You are a senior medical supervisor specialized in {self.specialty.upper()}.
+        Your task is to REVIEW and IMPROVE the preliminary medical analysis.
         
-        refined_analysis = initial_analysis # Default
+        CRITICAL RULES:
+        1. The "Initial Analysis" contains conditions identified by the RAG system.
+        2. You MUST PRESERVE these conditions unless they are clearly wrong.
+        3. You can IMPROVE the reasoning or adjust probabilities if needed.
+        4. NEVER return an empty list if the Initial Analysis has conditions.
+        5. If the Initial Analysis is empty, generate conditions based on symptoms.
+        
+        OUTPUT FORMAT:
+        Return a valid JSON with this EXACT structure:
+        {{
+            "potential_conditions": [
+                {{"condition": "Name", "probability": "High|Medium|Low", "reasoning": "Explanation"}},
+                ...
+            ],
+            "sources_consulted": []
+        }}
+        
+        PROBABILITY VALUES: Use "High", "Medium", or "Low" (English, capitalized).
+        
+        PATIENT SYMPTOMS: {symptoms_summary}
+        {patient_context}
+        
+        INITIAL ANALYSIS TO REVIEW:
+        {json.dumps(initial_analysis, indent=2)}
+        
+        YOUR REVIEWED ANALYSIS (JSON only, no other text):
+        """
 
         try:
             reflection_response = ollama.chat(
                 model='llama3:8b',
                 messages=[{'role': 'system', 'content': reflection_system_prompt}],
                 options={'temperature': 0.0},
-                format='json'
+                format='json' 
             )
-
-            try:
-                refined_analysis_json = json.loads(reflection_response['message']['content'])
-
-                # --- VALIDAZIONE ROBUSTA (SOSTITUITA) ---
-                if "potential_conditions" in refined_analysis_json and isinstance(refined_analysis_json.get("potential_conditions"), list):
-                    
-                    validated_conditions = []
-                    is_valid_schema = True
-
-                    # Itera su ogni item restituito dall'LLM
-                    for item in refined_analysis_json["potential_conditions"]:
-                        # Controlla se l'item è un DIZIONARIO e ha le chiavi MINIME richieste
-                        if isinstance(item, dict) and "condition" in item and "probability" in item:
-                            validated_conditions.append(item)
-                        else:
-                            # L'item è una stringa (es. 'Fibromialgia') o un dizionario malformato
-                            print(f"⚠️ Riflessione ({self.specialty.upper()}) ha restituito un item non valido: '{item}'. Scartato.")
-                            is_valid_schema = False
-                    
-                    if not is_valid_schema:
-                         print(f"⚠️ Riflessione ({self.specialty.upper()}) ha restituito dati misti. Uso solo gli {len(validated_conditions)} item validati.")
-                    else:
-                         print(f"✨ Analisi RAG Raffinata ({self.specialty.upper()}) (Schema Valido): {refined_analysis_json}")
-
-                    # Ricostruisci l'analisi solo con gli item validi
-                    refined_analysis = refined_analysis_json
-                    refined_analysis["potential_conditions"] = validated_conditions
-                    
-                    # Aggiungi le fonti originali (come prima)
-                    if "sources_consulted" not in refined_analysis:
-                        refined_analysis["sources_consulted"] = initial_analysis.get("sources_consulted", [])
-                
-                else:
-                     print(f"⚠️ Riflessione ({self.specialty.upper()}) JSON non valido (manca 'potential_conditions' o non è una lista). Uso analisi iniziale.")
             
-            except json.JSONDecodeError:
-                print(f"❌ Errore parsing JSON riflessione ({self.specialty.upper()}). Uso analisi iniziale. Risposta LLM: {reflection_response['message']['content']}")
+            content = reflection_response['message']['content']
+            
+            # --- DEBUG: Log della risposta raw ---
+            logger.debug(f"Riflessione RAW response: {content[:500]}...")
+            
+            # --- VALIDAZIONE PYDANTIC ---
+            # Qui avviene la magia: se il JSON è sbagliato, Pydantic solleva un errore
+            # e noi lo catturiamo invece di far crashare l'app più avanti.
+            validated_data = MedicalAnalysis.model_validate_json(content)
+            
+            # Convertiamo in dict per il resto del sistema
+            refined_analysis = validated_data.model_dump()
+            
+            # --- DEBUG: Verifica contenuto ---
+            if not refined_analysis.get("potential_conditions"):
+                logger.warning(f"Riflessione ha ritornato lista VUOTA. Initial analysis aveva: {len(initial_analysis.get('potential_conditions', []))} condizioni")
+            
+            # Reinseriamo le fonti originali se l'LLM le ha perse
+            if not refined_analysis.get("sources_consulted"):
+                 refined_analysis["sources_consulted"] = initial_analysis.get("sources_consulted", [])
+
+            logger.info(f"Riflessione Validata con successo ({len(refined_analysis['potential_conditions'])} condizioni).")
+            return refined_analysis
 
         except Exception as e:
-            print(f"❌ Errore durante Riflessione ({self.specialty.upper()}): {e}. Uso analisi iniziale.")
-            
-        return refined_analysis
+            logger.error(f"Errore Validazione Pydantic ({self.specialty.upper()}): {e}")
+            logger.debug(f"Contenuto che ha causato errore: {content[:300] if 'content' in dir() else 'N/A'}...")
+            logger.warning(f"Uso analisi iniziale come fallback (aveva {len(initial_analysis.get('potential_conditions', []))} condizioni).")
+            return initial_analysis
 
 
-    def perform_analysis_and_triage(self, symptoms_summary: str, extracted_data: dict = None) -> dict:
+    def _force_diagnosis(self, symptoms: str) -> dict:
+        """
+        Ultima spiaggia: Chiede all'LLM di generare ipotesi basandosi SOLO sui sintomi.
+        Bypassa validazioni complesse per garantire un output.
+        """
+        prompt = f"""
+        You are a medical specialist in {self.specialty.upper()}.
+        The patient's symptoms are: "{symptoms}".
+        
+        The RAG system produced no results.
+        YOU MUST list the 3 most probable conditions based on your general knowledge.
+        
+        Return ONLY a JSON:
+        {{
+            "potential_conditions": [
+                {{ "condition": "Condition 1", "probability": "Medium", "reasoning": "..." }},
+                {{ "condition": "Condition 2", "probability": "Low", "reasoning": "..." }}
+            ]
+        }}
+        """
+        try:
+            response = ollama.chat(model='llama3:8b', messages=[{'role': 'user', 'content': prompt}], format='json')
+            return json.loads(response['message']['content'])
+        except Exception as e:
+            logger.error(f" Errore Force Diagnosis: {e}")
+            return {"potential_conditions": []}
+
+    def perform_analysis_and_triage(self, symptoms_summary: str, extracted_data: dict = None, patient_data: dict = None) -> dict:
         """
         Esegue l'analisi RAG, la Riflessione e la decisione di triage.
         """
-        print(f"--- {self.specialty.upper()} AGENT: Esecuzione Analisi Finale per '{symptoms_summary}' ---")
+        logger.info(f" {self.specialty.upper()} AGENT: Analisi Finale ---")
 
-        tool_results_md = ""
+        # --- COSTRUZIONE QUERY RAG DA PATIENT_DATA (più affidabile del summary LLM) ---
+        rag_query = symptoms_summary  # Fallback al summary originale
+        
+        if patient_data:
+            # Costruisci query strutturata dai dati estratti dall'AssistantAgent
+            query_parts = []
+            
+            # Sintomi (campo più importante)
+            if patient_data.get("symptoms"):
+                symptoms_list = patient_data["symptoms"]
+                # Prendi i sintomi più significativi (non "haven't been feeling well")
+                meaningful_symptoms = [s for s in symptoms_list if len(s) > 15 and "well" not in s.lower()]
+                if meaningful_symptoms:
+                    query_parts.append("Patient with: " + ", ".join(meaningful_symptoms[:5]))
+            
+            # Durata
+            if patient_data.get("duration"):
+                query_parts.append("Duration: " + ", ".join(patient_data["duration"][:2]))
+            
+            # Allergie note
+            if patient_data.get("allergies"):
+                query_parts.append("Known allergies: " + ", ".join(patient_data["allergies"]))
+            
+            # Storia medica
+            if patient_data.get("medical_history"):
+                query_parts.append("History: " + ", ".join(patient_data["medical_history"][:2]))
+            
+            # Se abbiamo costruito qualcosa di significativo, usalo
+            if query_parts and len(" ".join(query_parts)) > 30:
+                rag_query = " | ".join(query_parts)
+                logger.info(f"Query RAG costruita da patient_data: {rag_query[:100]}...")
+            else:
+                logger.info(f"Uso summary LLM per query RAG: {symptoms_summary[:100]}...")
+
+        # 1. Esecuzione Tool Simbolici
         tool_report_items = []
         if extracted_data:
             try:
                 if "temperature_celsius" in extracted_data:
+                    # La funzione classify_fever ora gestisce stringhe e virgole internamente
                     result = medical_calculators.classify_fever(extracted_data["temperature_celsius"])
-                    tool_report_items.append(f"Analisi Temperatura: {result['interpretation']}")
+                    if "error" not in result:
+                        tool_report_items.append(f"🌡️ Analisi Temperatura: {result['interpretation']}")
+                
                 if "pain_score" in extracted_data:
                     result = medical_calculators.classify_pain_level(extracted_data["pain_score"])
-                    tool_report_items.append(f"Analisi Dolore: {result['category']}")
-                if "duration_value" in extracted_data and "duration_unit" in extracted_data:
-                     result = medical_calculators.classify_symptom_duration(extracted_data["duration_value"], extracted_data["duration_unit"])
-                     tool_report_items.append(f"Analisi Durata: {result['category']} (circa {result['total_days_approx']} giorni)")
-
+                    if "error" not in result:
+                         tool_report_items.append(f"😖 Analisi Dolore: Livello {result.get('score_input', '?')} - {result['category']}")
+                
+                if "systolic" in extracted_data and "diastolic" in extracted_data:
+                    result = medical_calculators.classify_blood_pressure(extracted_data["systolic"], extracted_data["diastolic"])
+                    if "error" not in result:
+                        tool_report_items.append(f"💓 Pressione: {result['category']} ({result['interpretation']})")
 
             except Exception as e:
-                print(f"⚠️ Errore durante l'esecuzione dei tool simbolici: {e}")
-                tool_report_items.append("Errore nell'analisi dei dati numerici.")
+                logger.warning(f" Errore esecuzione tool: {e}")
 
+        tool_results_md = ""
         if tool_report_items:
-            tool_results_md = "\n\n---\n### Analisi Dati Simbolici\n" + "\n".join(f"- {item}" for item in tool_report_items)
+            tool_results_md = "\n\n---\n### 📊 Analisi Parametri Vitali\n" + "\n".join(f"- {item}" for item in tool_report_items)
 
-        # 1. Fase RAG (ottiene analisi iniziale)
-        initial_rag_analysis = self.rag_handler.get_potential_conditions(symptoms_summary, self.specialty)
-        print(f"🧠 {self.specialty.upper()} RAG Analysis Iniziale: {initial_rag_analysis}")
-
-        # Controlla se RAG iniziale ha fallito
-        if "error" in initial_rag_analysis or not isinstance(initial_rag_analysis.get("potential_conditions"), list):
-            print(f"⚠️ {self.specialty.upper()} RAG iniziale fallito o formato non valido.")
-            default_resp = self.triage_engine.kb['risposta_default'].copy()
-            default_resp["specialist_consulted"] = self.specialty
-            return {"type": "triage_result", "data": default_resp}
+        # 2. Fase RAG (usa la query costruita da patient_data)
+        initial_rag_analysis = self.rag_handler.get_potential_conditions(rag_query, self.specialty)
         
-        # Se RAG iniziale non ha trovato condizioni, non serve riflessione
-        if not initial_rag_analysis.get("potential_conditions"):
-            print(f"ℹ️ {self.specialty.upper()} RAG iniziale non ha trovato condizioni. Salto riflessione.")
-            final_analysis = initial_rag_analysis # Usa l'analisi vuota
-        else:
-            # 2. Fase di Riflessione
-            final_analysis = self._run_reflection(symptoms_summary, initial_rag_analysis)
+        # --- DEBUG: Log dell'analisi RAG ---
+        rag_conditions_count = len(initial_rag_analysis.get("potential_conditions", []))
+        logger.info(f"RAG ha ritornato {rag_conditions_count} condizioni iniziali.")
 
-        # 3. Fase Simbolica (usa l'analisi finale, che sia quella iniziale o quella raffinata)
-        recommendation = self.triage_engine.get_recommendation(final_analysis)
-        print(f"🛡️ {self.specialty.upper()} Decisione Simbolica (post-riflessione): '{recommendation['livello']}'")
+        # Controlla fallimento RAG
+        if "error" in initial_rag_analysis or not isinstance(initial_rag_analysis.get("potential_conditions"), list):
+            error_msg = initial_rag_analysis.get("error", "Formato non valido")
+            logger.warning(f"RAG fallito. Motivo: {error_msg}")
+            logger.debug(f"Dati ricevuti: {initial_rag_analysis}")
+            
+            # NON ritornare subito! Passiamo al Supervisore con una lista vuota.
+            # Questo attiverà la generazione basata su conoscenza generale.
+            initial_rag_analysis = {"potential_conditions": [], "error": error_msg}
+        
+        # 3. Fase di Riflessione (SEMPRE ATTIVA)
+        # Anche se RAG non ha trovato nulla, chiediamo al Supervisore di ragionare sui sintomi.
+        final_analysis = self._run_reflection(symptoms_summary, initial_rag_analysis, patient_data)
 
-        # 4. Combina Risultati
+        # --- HARD FALLBACK: SE ANCORA VUOTO, FORZA GENERAZIONE ---
+        if not final_analysis.get("potential_conditions"):
+            logger.warning(f" {self.specialty.upper()}: Analisi ancora vuota dopo riflessione. FORZO GENERAZIONE.")
+            final_analysis = self._force_diagnosis(symptoms_summary)
+
+        # 4. Fase Simbolica (Decisione Triage)
+        
+        # --- ORDINAMENTO E LIMITAZIONE REFERTO ---
+        conditions = final_analysis.get("potential_conditions", [])
+        if conditions:
+            # Mappa probabilità -> peso numerico (supporta IT e EN)
+            prob_map = {
+                # Italiano
+                "alta": 3, "alto": 3,
+                "media": 2, "medio": 2,
+                "bassa": 1, "basso": 1,
+                # Inglese
+                "high": 3,
+                "medium": 2, "moderate": 2,
+                "low": 1
+            }
+            
+            # Funzione helper per ottenere il peso (default 0 se sconosciuto)
+            def get_weight(cond):
+                p = cond.get("probability", "").lower().strip()
+                return prob_map.get(p, 0)
+            
+            # Ordina decrescente (Alta -> Media -> Bassa)
+            conditions.sort(key=get_weight, reverse=True)
+            
+            # Tieni solo i Top 3
+            final_analysis["potential_conditions"] = conditions[:3]
+            
+            # --- LOGGING TERMINALE REFERTO ---
+            logger.info(f"REFERTO MEDICO ({self.specialty.upper()})")
+            for i, cond in enumerate(final_analysis["potential_conditions"]):
+                logger.info(f"{i+1}. {cond.get('condition')} ({cond.get('probability')})")
+                logger.debug(f"   Reasoning: {cond.get('reasoning')}")
+
+        recommendation = self.triage_engine.get_recommendation(final_analysis, extracted_data)
+
+        # 5. Costruzione Output Finale
         final_response_data = {
             "specialist_consulted": self.specialty,
-            "livello": recommendation.get('livello', 'Info Insufficienti'),
+            "livello": recommendation.get('livello', 'Insufficient Info'),
             "messaggio": recommendation.get('messaggio', self.triage_engine.kb['risposta_default']['messaggio']),
             "referto": final_analysis.get("potential_conditions", []),
             "sources_consulted": final_analysis.get("sources_consulted", []),
-            # --- RIGA DA AGGIUNGERE ---
             "tool_report": tool_results_md 
         }
+        
         return {"type": "triage_result", "data": final_response_data}

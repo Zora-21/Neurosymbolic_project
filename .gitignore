@@ -1,7 +1,15 @@
 libri/
 venv/
+
+test_1/
+test_2/
+test_3/
+check/
+
 app/__pycache__/
 tools/__pycache__/
 logic/__pycache__/
 agents/__pycache__/
 documenti_medici/
+
+clean_test_data.sh
