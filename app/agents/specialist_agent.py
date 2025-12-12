@@ -43,7 +43,7 @@ class SpecialistAgent:
         
         Your task is to return a refined JSON. Your rules are:
         1. Evaluate the initial analysis: is it correct? Is it relevant to the symptoms?
-        2. If the initial analysis is good, return it.
+        2. If the initial analysis is good, return it (adding treatment if missing).
         3. If the initial analysis is incorrect, irrelevant, or incomplete (or EMPTY), YOU MUST correct it or create a new one.
         4. CRITICAL: If "potential_conditions" is empty, USE YOUR GENERAL MEDICAL KNOWLEDGE to formulate at least 3 plausible hypotheses based on symptoms, marking them as "Low" or "Medium" probability. NEVER RETURN AN EMPTY LIST.
         
@@ -57,6 +57,7 @@ class SpecialistAgent:
         - "condition": Condition name (e.g., "Acute Bronchitis").
         - "probability": Probability ("High", "Medium", "Low").
         - "reasoning": Explanation (max 2 sentences).
+        - "treatment": Suggested therapy (medications, lifestyle changes, or specialist referral).
 
         Summarized Symptoms: {symptoms_summary}
         Preliminary Analysis:
@@ -239,12 +240,13 @@ class SpecialistAgent:
         
         The RAG system produced no results.
         YOU MUST list the 3 most probable conditions based on your general knowledge.
+        For each condition, include a suggested treatment.
         
         Return ONLY a JSON:
         {{
             "potential_conditions": [
-                {{ "condition": "Condition 1", "probability": "Medium", "reasoning": "..." }},
-                {{ "condition": "Condition 2", "probability": "Low", "reasoning": "..." }}
+                {{ "condition": "Condition 1", "probability": "Medium", "reasoning": "...", "treatment": "Suggested therapy..." }},
+                {{ "condition": "Condition 2", "probability": "Low", "reasoning": "...", "treatment": "Suggested therapy..." }}
             ]
         }}
         """

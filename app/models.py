@@ -5,6 +5,7 @@ class Condition(BaseModel):
     condition: str = Field(..., description="Il nome della patologia identificata.")
     probability: str = Field(..., description="La probabilità della condizione basata sui sintomi (High, Medium, Low).")
     reasoning: str = Field(..., description="Breve spiegazione (max 2 frasi) del perché questa condizione è rilevante.")
+    treatment: str = Field(default="", description="Suggested treatment or therapy for this condition.")
     
     @field_validator('probability')
     @classmethod

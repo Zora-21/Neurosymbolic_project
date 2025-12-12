@@ -138,12 +138,14 @@ class RAGHandler:
                 {{
                     "condition": "Rheumatoid Arthritis",
                     "probability": "High",
-                    "reasoning": "Morning stiffness > 1 hour and bilateral hand pain match the description in document X..."
+                    "reasoning": "Morning stiffness > 1 hour and bilateral hand pain match the description in document X...",
+                    "treatment": "NSAIDs for pain relief, DMARDs (e.g., methotrexate) for disease modification, physical therapy"
                 }},
                 {{
                     "condition": "Osteoarthritis",
                     "probability": "Low",
-                    "reasoning": "Missing systemic inflammatory component..."
+                    "reasoning": "Missing systemic inflammatory component...",
+                    "treatment": "Acetaminophen or NSAIDs, weight management, joint exercises"
                 }}
             ]
         }}
@@ -154,7 +156,8 @@ class RAGHandler:
                 {{
                     "condition": "Condition Name",
                     "probability": "High/Medium/Low",
-                    "reasoning": "Explanation based on text..."
+                    "reasoning": "Explanation based on text...",
+                    "treatment": "Suggested therapy: medications, lifestyle changes, or specialist referral"
                 }}
             ]
         }}

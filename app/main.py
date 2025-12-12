@@ -184,7 +184,10 @@ async def handle_chat(user_message: UserMessage):
                     if data.get("referto"):
                         md_response += "\n\n---\n### Clinical Hypotheses (AI)\n"
                         for item in data.get("referto"):
+                            treatment = item.get('treatment', '')
                             md_response += f"- **{item.get('condition')}** ({item.get('probability')})\n  _{item.get('reasoning')}_\n"
+                            if treatment:
+                                md_response += f"  💊 **Suggested Treatment:** {treatment}\n"
 
                     # Resetta sessione dopo diagnosi
                     session_manager.save_session(session_id, {
@@ -350,7 +353,10 @@ async def handle_chat(user_message: UserMessage):
                             nome = item.get('condition', 'N/A')
                             prob = item.get('probability', 'N/A')
                             reason = item.get('reasoning', '')
+                            treatment = item.get('treatment', '')
                             md_response += f"- **{nome}** ({prob})\n  _{reason}_\n"
+                            if treatment:
+                                md_response += f"  💊 **Suggested Treatment:** {treatment}\n"
                     
                     agent_response_content = md_response
                     is_final = True  # Triage completato
