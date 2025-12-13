@@ -150,9 +150,15 @@ def classify_symptom_duration(duration_value: Any, duration_unit: str) -> Dict[s
 
 # --- TOOL SPECIFICI ---
 
-def calculate_simple_curb65(age: Any, confusion: bool, respiratory_rate: Any) -> Dict[str, Any]:
+def calculate_simple_curb65(age: Any, confusion: bool, respiratory_rate: Any, urea_mmol_l: Any = None, systolic_bp: Any = None, diastolic_bp: Any = None) -> Dict[str, Any]:
     """
-    Calcola uno score CURB-65 semplificato.
+    Calcola lo score CURB-65 completo (5 parametri).
+    Criteri:
+    - Confusione (+1)
+    - Urea > 7 mmol/L (+1)
+    - Respiri >= 30/min (+1)
+    - Pressione: Sistolica < 90 OR Diastolica <= 60 (+1)
+    - Età >= 65 (+1)
     """
     try:
         score = 0
@@ -160,30 +166,57 @@ def calculate_simple_curb65(age: Any, confusion: bool, respiratory_rate: Any) ->
         
         age_val = _safe_int(age)
         resp_rate_val = _safe_int(respiratory_rate)
-
+        
+        # 1. Età
         if age_val >= 65:
             score += 1
             reasoning.append("Età >= 65 anni (+1)")
         
+        # 2. Confusione
         if bool(confusion):
             score += 1
             reasoning.append("Presenza di confusione mentale (+1)")
             
+        # 3. Frequenza Respiratoria
         if resp_rate_val >= 30:
             score += 1
             reasoning.append("Frequenza respiratoria >= 30/min (+1)")
 
+        # 4. Urea (Opzionale nel vecchio, ora richiesto se disponibile)
+        if urea_mmol_l is not None:
+             try:
+                 urea_val = _safe_float(urea_mmol_l)
+                 if urea_val > 7:
+                     score += 1
+                     reasoning.append(f"Urea SIERICA > 7 mmol/L ({urea_val}) (+1)")
+             except ValueError:
+                 reasoning.append("Dato Urea non valido/assente (assumo normale)")
+
+        # 5. Pressione Sanguigna
+        if systolic_bp is not None and diastolic_bp is not None:
+            try:
+                sys_val = _safe_int(systolic_bp)
+                dia_val = _safe_int(diastolic_bp)
+                if sys_val < 90 or dia_val <= 60:
+                    score += 1
+                    reasoning.append(f"Pressione bassa ({sys_val}/{dia_val}) -> Sistolica < 90 o Diastolica <= 60 (+1)")
+            except ValueError:
+                 reasoning.append("Dati Pressione non validi (assumo stabili)")
+
+        # Interpretazione (Scala 0-5)
         if score == 0:
-            interpretation = "Rischio Basso. Generalmente trattabile a domicilio."
+            interpretation = "Rischio Basso (0,7% mortalità). Trattabile a domicilio."
         elif score == 1:
-            interpretation = "Rischio Medio-Basso. Considerare valutazione medica."
+             interpretation = "Rischio Basso (2,1% mortalità). Probabile trattamento domiciliare."
         elif score == 2:
-            interpretation = "Rischio Moderato. Considerare ricovero ospedaliero."
-        else: # score 3
-            interpretation = "Rischio Alto. Ricovero urgente raccomandato."
+            interpretation = "Rischio Moderato (9,2% mortalità). Considerare ricovero ospedaliero breve."
+        elif score == 3:
+            interpretation = "Rischio Alto (14,5% mortalità). Ricovero necessario, considerare Terapia Intensiva."
+        elif score >= 4:
+             interpretation = f"Rischio Molto Alto (Score {score}). Ricovero immediato, considerare Terapia Intensiva."
 
         result = {
-            "tool_name": "Simple_CURB-65_Score",
+            "tool_name": "Full_CURB-65_Score",
             "score": score,
             "interpretation": interpretation,
             "factors": reasoning
