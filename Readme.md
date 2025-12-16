@@ -46,7 +46,7 @@ ollama run llama3:8b
 uvicorn app.main:app --reload
 
 # 3. Avvia frontend (opzionale)
-streamlit run ui.py
+localhost:8000
 ```
 
 ## Test
